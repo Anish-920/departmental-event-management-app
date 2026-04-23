@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "624093324864",
+    "project_id": "sufel-event-app-2026",
+    "storage_bucket": "sufel-event-app-2026.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:624093324864:android:8f964eb7a4c7eca615e1a5",
+        "android_client_info": {
+          "package_name": "com.example.event_management"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB7S6TeazRZ6gDNfZHipgq9e6fWjQt9gYc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
