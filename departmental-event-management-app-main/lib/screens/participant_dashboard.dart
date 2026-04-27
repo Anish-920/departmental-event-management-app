@@ -673,11 +673,11 @@ class _ScanningTab extends StatelessWidget {
                   Container(
                     width: 36, height: 36,
                     decoration: BoxDecoration(color: (step.$5 as Color).withOpacity(0.12), shape: BoxShape.circle),
-                    child: Icon(step.$3 as IconData, color: step.$5 as Color, size: 18),
+                    child: Icon(step.$2 as IconData, color: step.$5 as Color, size: 18),
                   ),
                   const SizedBox(width: 14),
                   Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Text(step.$4 as String, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Color(0xFF0E1424))),
+                    Text(step.$3 as String, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Color(0xFF0E1424))),
                     const SizedBox(height: 2),
                     Text(step.$5 == Colors.indigo ? 'Request to join an event and wait for organizer approval'
                         : step.$5 == Colors.teal ? 'At the event, locate the QR code at the entrance'
