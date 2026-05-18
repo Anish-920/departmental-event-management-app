@@ -1,7 +1,8 @@
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:excel/excel.dart' hide Border;
+import 'package:excel/excel.dart' as ex;
+import 'package:syncfusion_flutter_xlsio/xlsio.dart' as xlsio;
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:open_file/open_file.dart';
@@ -9,6 +10,10 @@ import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+// Conditional import for web
+import 'dart:html' as html;
+import 'package:flutter/services.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Data model
@@ -147,53 +152,75 @@ class _ReportScreenState extends State<ReportScreen>
     _fadeCtrl.reset();
 
     try {
-      // Query ONLY the selected event's attendance subcollection
       final attSnap = await FirebaseFirestore.instance
           .collection('events')
           .doc(_selectedEventId)
           .collection('attendance')
           .get();
 
+      if (attSnap.docs.isEmpty) {
+        setState(() { _entries = []; _loading = false; _generated = true; });
+        _fadeCtrl.forward();
+        return;
+      }
+
       final List<_AttendanceEntry> results = [];
-
       final futures = attSnap.docs.map((doc) async {
-        final data = doc.data();
-        final userId = data['userId']?.toString() ?? '';
-        if (userId.isEmpty) return;
+        try {
+          final data = doc.data();
+          final userId = data['userId']?.toString() ?? '';
+          if (userId.isEmpty) return;
 
-        final userDoc = await FirebaseFirestore.instance
-            .collection('users').doc(userId).get();
-        final ud = userDoc.data() ?? {};
-        final rd = (ud['roleData'] as Map<dynamic, dynamic>?)
-                ?.map((k, v) => MapEntry(k.toString(), v)) ?? {};
-        final sd = (data['studentDetails'] as Map<dynamic, dynamic>?)
-                ?.map((k, v) => MapEntry(k.toString(), v)) ?? {};
+          // Try to get details from attendance doc first (faster)
+          final sd = (data['studentDetails'] as Map<dynamic, dynamic>?)
+                  ?.map((k, v) => MapEntry(k.toString(), v)) ?? {};
+          
+          Map<String, dynamic> rd = {};
+          String name = (sd['name'] ?? 'Unknown').toString();
+          String branch = (sd['branch'] ?? sd['department'] ?? '').toString();
+          String section = (sd['section'] ?? '').toString();
+          String year = (sd['year'] ?? '').toString();
 
-        // Resolve section
-        final profileSection = (rd['section'] ?? sd['section'] ?? '').toString().toUpperCase().trim();
-        if (profileSection != _selectedSection!.toUpperCase()) return;
+          // If details missing, fetch from user profile
+          if (name == 'Unknown' || section.isEmpty || year.isEmpty) {
+            final userDoc = await FirebaseFirestore.instance.collection('users').doc(userId).get();
+            if (userDoc.exists) {
+              final ud = userDoc.data() ?? {};
+              name = (ud['name'] ?? name).toString();
+              final roleData = (ud['roleData'] as Map<dynamic, dynamic>?)
+                      ?.map((k, v) => MapEntry(k.toString(), v)) ?? {};
+              rd = roleData;
+              if (branch.isEmpty) branch = (rd['branch'] ?? rd['department'] ?? '').toString();
+              if (section.isEmpty) section = (rd['section'] ?? '').toString();
+              if (year.isEmpty) year = (rd['year'] ?? '').toString();
+            }
+          }
 
-        // Resolve year — normalise "2", "2nd Year", "2nd" all to compare
-        final rawYear = (rd['year'] ?? sd['year'] ?? '').toString().trim();
-        final normProfile = _normaliseYear(rawYear);
-        final normSelected = _normaliseYear(_selectedYear!);
-        if (normProfile != normSelected) return;
+          // Robust Section Matching
+          final normProfileSec = section.toUpperCase().replaceAll('SECTION', '').trim();
+          final normSelectedSec = _selectedSection!.toUpperCase().replaceAll('SECTION', '').trim();
+          if (normProfileSec != normSelectedSec && !section.contains(_selectedSection!)) return;
 
-        final branch = (rd['department'] ?? rd['branch'] ?? sd['department'] ?? sd['branch'] ?? _selectedBranch ?? '').toString();
-        final name = (ud['name'] ?? sd['name'] ?? 'Unknown').toString();
+          // Robust Year Matching
+          final normProfileYear = _normaliseYear(year);
+          final normSelectedYear = _normaliseYear(_selectedYear!);
+          if (normProfileYear != normSelectedYear) return;
 
-        final Timestamp? entryTs = data['entryTime'] as Timestamp?;
-        final Timestamp? exitTs  = data['exitTime']  as Timestamp?;
+          final Timestamp? entryTs = data['entryTime'] as Timestamp?;
+          final Timestamp? exitTs  = data['exitTime']  as Timestamp?;
 
-        results.add(_AttendanceEntry(
-          studentName: name,
-          uid: userId,
-          branch: branch.isEmpty ? (_selectedBranch ?? '') : branch,
-          section: profileSection,
-          year: rawYear,
-          entryTime: entryTs?.toDate(),
-          exitTime:  exitTs?.toDate(),
-        ));
+          results.add(_AttendanceEntry(
+            studentName: name,
+            uid: userId,
+            branch: branch.isEmpty ? (_selectedBranch ?? '') : branch,
+            section: section.isEmpty ? _selectedSection! : section,
+            year: year.isEmpty ? _selectedYear! : year,
+            entryTime: entryTs?.toDate(),
+            exitTime:  exitTs?.toDate(),
+          ));
+        } catch (e) {
+          debugPrint('Error processing attendance doc ${doc.id}: $e');
+        }
       });
 
       await Future.wait(futures);
@@ -203,7 +230,7 @@ class _ReportScreenState extends State<ReportScreen>
       _fadeCtrl.forward();
     } catch (e) {
       setState(() => _loading = false);
-      _showSnack('Error: $e');
+      _showSnack('Fetch failed: $e');
     }
   }
 
@@ -217,55 +244,165 @@ class _ReportScreenState extends State<ReportScreen>
 
   // ── Excel Export ──
   Future<void> _exportToExcel() async {
-    final excel = Excel.createExcel();
-    final sheetName = 'Attendance_Report';
-    excel.rename('Sheet1', sheetName);
-    final sheet = excel[sheetName];
+    setState(() => _loading = true);
+    
+    // Create a workbook
+    final xlsio.Workbook workbook = xlsio.Workbook();
+    final xlsio.Worksheet sheet = workbook.worksheets[0];
+    sheet.name = 'Attendance_Report';
 
-    // Header style
-    final headerStyle = CellStyle(
-      bold: true,
-      backgroundColorHex: ExcelColor.fromHexString('#C62828'),
-      fontColorHex: ExcelColor.fromHexString('#FFFFFF'),
-      horizontalAlign: HorizontalAlign.Center,
-    );
-
-    final headers = ['#', 'Student Name', 'UID', 'Branch', 'Section', 'Year', 'Entry Time', 'Exit Time'];
-    for (var i = 0; i < headers.length; i++) {
-      final cell = sheet.cell(CellIndex.indexByColumnRow(columnIndex: i, rowIndex: 0));
-      cell.value = TextCellValue(headers[i]);
-      cell.cellStyle = headerStyle;
+    // Load logo bytes
+    Uint8List? logoBytes;
+    try {
+      logoBytes = (await rootBundle.load('assets/images/college_logo_blue.png')).buffer.asUint8List();
+    } catch (e) {
+      debugPrint('Excel logo load error: $e');
     }
 
-    final fmt = DateFormat('dd MMM yyyy HH:mm');
-    for (var i = 0; i < _entries.length; i++) {
-      final e = _entries[i];
-      final row = [
-        '${i + 1}',
-        e.studentName,
-        e.uid.length >= 8 ? e.uid.substring(0, 8) : e.uid,
-        e.branch,
-        e.section,
-        e.year,
-        e.entryTime != null ? fmt.format(e.entryTime!) : '--',
-        e.exitTime  != null ? fmt.format(e.exitTime!)  : '--',
-      ];
-      for (var j = 0; j < row.length; j++) {
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: j, rowIndex: i + 1))
-          .value = TextCellValue(row[j]);
+    final blueColor = '0D47A1'; // Deep Blue (Hex for XlsIO)
+
+    // 1. Add Logo
+    if (logoBytes != null) {
+      try {
+        final xlsio.Picture picture = sheet.pictures.addStream(1, 1, logoBytes);
+        picture.height = 70;
+        picture.width = 70;
+      } catch (e) {
+        debugPrint('Error adding image to Excel: $e');
       }
     }
 
-    final bytes = excel.save();
-    if (bytes == null) { _showSnack('Failed to generate Excel file.'); return; }
+    // 2. Institutional Header
+    // Merge cells for titles
+    sheet.getRangeByName('B1:H1').merge();
+    final title1 = sheet.getRangeByName('B1');
+    title1.setText('ST. VINCENT PALLOTTI');
+    title1.cellStyle.bold = true;
+    title1.cellStyle.fontSize = 18;
+    title1.cellStyle.fontColor = '#$blueColor';
+    title1.cellStyle.hAlign = xlsio.HAlignType.center;
 
-    final dir = await getApplicationDocumentsDirectory();
-    final safeEvent = (_selectedEventTitle ?? 'Event').replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_');
-    final fileName = 'Report_${safeEvent}_Sec${_selectedSection}_${_selectedYear?.replaceAll(' ', '_')}.xlsx';
-    final file = File('${dir.path}/$fileName');
-    await file.writeAsBytes(bytes);
-    await OpenFile.open(file.path);
-    _showSnack('Excel saved: $fileName');
+    sheet.getRangeByName('B2:H2').merge();
+    final title2 = sheet.getRangeByName('B2');
+    title2.setText('COLLEGE OF ENGINEERING & TECHNOLOGY, NAGPUR');
+    title2.cellStyle.bold = true;
+    title2.cellStyle.fontSize = 12;
+    title2.cellStyle.fontColor = '#$blueColor';
+    title2.cellStyle.hAlign = xlsio.HAlignType.center;
+
+    sheet.getRangeByName('B3:H3').merge();
+    final title3 = sheet.getRangeByName('B3');
+    title3.setText('(AN AUTONOMOUS INSTITUTION)');
+    title3.cellStyle.bold = true;
+    title3.cellStyle.fontSize = 9;
+    title3.cellStyle.fontColor = '#FFFFFF';
+    title3.cellStyle.backColor = '#$blueColor';
+    title3.cellStyle.hAlign = xlsio.HAlignType.center;
+
+    // 3. Report Info
+    sheet.getRangeByName('A5:H5').merge();
+    final dept = sheet.getRangeByName('A5');
+    dept.setText('Department of Computer Science Engineering');
+    dept.cellStyle.bold = true;
+    dept.cellStyle.fontSize = 14;
+    dept.cellStyle.hAlign = xlsio.HAlignType.center;
+
+    sheet.getRangeByName('A6:H6').merge();
+    final reportTitle = sheet.getRangeByName('A6');
+    reportTitle.setText('Activity/ Event Report — Session: 2024 - 25');
+    reportTitle.cellStyle.bold = true;
+    reportTitle.cellStyle.fontSize = 12;
+    reportTitle.cellStyle.hAlign = xlsio.HAlignType.center;
+
+    sheet.getRangeByName('A7:H7').merge();
+    final eventName = sheet.getRangeByName('A7');
+    eventName.setText('Event: ${_selectedEventTitle ?? "N/A"}');
+    eventName.cellStyle.bold = true;
+    eventName.cellStyle.hAlign = xlsio.HAlignType.center;
+
+    // Filter info
+    sheet.getRangeByName('A9').setText('Filters Applied:');
+    sheet.getRangeByName('B9:H9').merge();
+    sheet.getRangeByName('B9').setText('Section: $_selectedSection, Year: $_selectedYear, Branch: $_selectedBranch');
+
+    // 4. Data Table Header
+    int startRow = 11;
+    final headers = ['#', 'Student Name', 'UID', 'Branch', 'Section', 'Year', 'Entry Time', 'Exit Time'];
+    for (int i = 0; i < headers.length; i++) {
+      final cell = sheet.getRangeByIndex(startRow, i + 1);
+      cell.setText(headers[i]);
+      cell.cellStyle.backColor = '#$blueColor';
+      cell.cellStyle.fontColor = '#FFFFFF';
+      cell.cellStyle.bold = true;
+    }
+
+    // 5. Data Table Content
+    final fmt = DateFormat('dd MMM yyyy HH:mm');
+    for (int i = 0; i < _entries.length; i++) {
+      final entry = _entries[i];
+      final row = startRow + 1 + i;
+      sheet.getRangeByIndex(row, 1).setNumber((i + 1).toDouble());
+      sheet.getRangeByIndex(row, 2).setText(entry.studentName);
+      sheet.getRangeByIndex(row, 3).setText(entry.uid);
+      sheet.getRangeByIndex(row, 4).setText(entry.branch);
+      sheet.getRangeByIndex(row, 5).setText(entry.section);
+      sheet.getRangeByIndex(row, 6).setText(entry.year);
+      sheet.getRangeByIndex(row, 7).setText(entry.entryTime != null ? fmt.format(entry.entryTime!) : '-');
+      sheet.getRangeByIndex(row, 8).setText(entry.exitTime != null ? fmt.format(entry.exitTime!) : '-');
+    }
+
+    // Summary
+    int summaryRow = startRow + _entries.length + 2;
+    sheet.getRangeByIndex(summaryRow, 1).setText('Total Participants:');
+    sheet.getRangeByIndex(summaryRow, 2).setNumber(_entries.length.toDouble());
+    sheet.getRangeByIndex(summaryRow + 2, 1).setText('This is a system-generated report');
+
+    // Fast column width setting (Avoid autoFitColumn for performance)
+    sheet.setColumnWidthInPixels(1, 40);  // #
+    sheet.setColumnWidthInPixels(2, 200); // Name
+    sheet.setColumnWidthInPixels(3, 100); // UID
+    sheet.setColumnWidthInPixels(4, 150); // Branch
+    sheet.setColumnWidthInPixels(5, 70);  // Section
+    sheet.setColumnWidthInPixels(6, 70);  // Year
+    sheet.setColumnWidthInPixels(7, 130); // Entry
+    sheet.setColumnWidthInPixels(8, 130); // Exit
+
+    try {
+      final List<int> bytes = workbook.saveAsStream();
+      workbook.dispose();
+
+      if (kIsWeb) {
+        // Web Download Logic
+        try {
+          final blob = html.Blob([bytes], 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+          final url = html.Url.createObjectUrlFromBlob(blob);
+          final anchor = html.AnchorElement(href: url)
+            ..setAttribute('download', 'Attendance_Report_${DateTime.now().millisecondsSinceEpoch}.xlsx')
+            ..click();
+          html.Url.revokeObjectUrl(url);
+          _showSnack('Excel Report Downloaded Successfully');
+        } catch (e) {
+          _showSnack('Web Download Error: $e');
+        }
+      } else {
+        // Mobile/Desktop Logic
+        final dir = await getTemporaryDirectory();
+        final file = File('${dir.path}/Attendance_Report_${DateTime.now().millisecondsSinceEpoch}.xlsx');
+        await file.writeAsBytes(bytes);
+        
+        final result = await OpenFile.open(file.path);
+        if (result.type != ResultType.done) {
+          _showSnack('Excel generated but could not be opened: ${result.message}');
+        } else {
+          _showSnack('Excel Report Exported Successfully');
+        }
+      }
+    } catch (e) {
+      debugPrint('Excel Export Error: $e');
+      _showSnack('Failed to export Excel: $e');
+    } finally {
+      setState(() => _loading = false);
+    }
   }
 
   // ── PDF Export ──
@@ -273,54 +410,131 @@ class _ReportScreenState extends State<ReportScreen>
     final pdf = pw.Document();
     final fmt = DateFormat('dd MMM yyyy, HH:mm');
 
+    // Try to load college logo (Arise & Shine)
+    pw.MemoryImage? logoImage;
+    try {
+      final logoData = await rootBundle.load('assets/images/college_logo_blue.png');
+      logoImage = pw.MemoryImage(logoData.buffer.asUint8List());
+    } catch (e) {
+      debugPrint('Logo not found at assets/images/college_logo_blue.png');
+    }
+
     pdf.addPage(pw.MultiPage(
       pageFormat: PdfPageFormat.a4,
-      margin: const pw.EdgeInsets.all(32),
+      margin: const pw.EdgeInsets.all(40),
       header: (ctx) => pw.Column(
-        crossAxisAlignment: pw.CrossAxisAlignment.start,
         children: [
-          pw.Text('Attendance Report — ${_selectedEventTitle ?? 'Event'}',
-              style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 4),
-          pw.Text('Section: $_selectedSection ($_selectedBranch)  |  Year: $_selectedYear',
-              style: const pw.TextStyle(fontSize: 11, color: PdfColors.grey800)),
-          pw.SizedBox(height: 2),
-          pw.Text('Generated: ${fmt.format(DateTime.now())}',
-              style: const pw.TextStyle(fontSize: 10, color: PdfColors.grey700)),
-          pw.Divider(thickness: 1),
-          pw.SizedBox(height: 8),
-        ],
-      ),
-      footer: (ctx) => pw.Align(
-        alignment: pw.Alignment.centerRight,
-        child: pw.Text('Page ${ctx.pageNumber} of ${ctx.pagesCount}',
-            style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey600)),
-      ),
-      build: (ctx) => [
-        pw.Container(
-          padding: const pw.EdgeInsets.all(12),
-          decoration: pw.BoxDecoration(
-            color: PdfColors.red50,
-            borderRadius: const pw.BorderRadius.all(pw.Radius.circular(8)),
-          ),
-          child: pw.Column(
-            crossAxisAlignment: pw.CrossAxisAlignment.start,
+          pw.Row(
+            crossAxisAlignment: pw.CrossAxisAlignment.center,
             children: [
-              pw.Text('Summary', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 13)),
-              pw.SizedBox(height: 6),
-              pw.Text('Total Students Present: ${_entries.length}',
-                  style: const pw.TextStyle(fontSize: 11)),
-              pw.Text('Branch: $_selectedBranch | Section: $_selectedSection | Year: $_selectedYear',
-                  style: const pw.TextStyle(fontSize: 10, color: PdfColors.grey800)),
+              // ── Left: Exact College Logo ──
+              if (logoImage != null)
+                pw.Container(
+                  width: 85, // Slightly larger for better readability
+                  height: 85,
+                  child: pw.Image(logoImage),
+                ),
+              pw.SizedBox(width: 25),
+
+              // ── Center: Formal Institutional Header ──
+              pw.Expanded(
+                child: pw.Column(
+                  crossAxisAlignment: pw.CrossAxisAlignment.center,
+                  children: [
+                    pw.Text('ST. VINCENT PALLOTTI',
+                        style: pw.TextStyle(
+                            fontSize: 20,
+                            fontWeight: pw.FontWeight.bold,
+                            color: PdfColors.blue900)),
+                    pw.Text('COLLEGE OF ENGINEERING & TECHNOLOGY, NAGPUR',
+                        style: pw.TextStyle(
+                            fontSize: 12,
+                            fontWeight: pw.FontWeight.bold,
+                            color: PdfColors.blue900),
+                        textAlign: pw.TextAlign.center),
+                    pw.SizedBox(height: 6),
+                    pw.Container(
+                      padding: const pw.EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+                      decoration: const pw.BoxDecoration(
+                        color: PdfColors.blue900,
+                        borderRadius: pw.BorderRadius.all(pw.Radius.circular(2)),
+                      ),
+                      child: pw.Text('(AN AUTONOMOUS INSTITUTION)',
+                          style: pw.TextStyle(
+                              fontSize: 9,
+                              fontWeight: pw.FontWeight.bold,
+                              color: PdfColors.white)),
+                    ),
+                  ],
+                ),
+              ),
+              // Balancing spacer
+              pw.SizedBox(width: 110), 
             ],
           ),
+          pw.SizedBox(height: 18),
+          pw.Text('Department of Computer Science Engineering',
+              style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold, color: PdfColors.blueGrey800)),
+          pw.SizedBox(height: 6),
+          pw.Text('Activity/ Event Report',
+              style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold, decoration: pw.TextDecoration.underline, color: PdfColors.blueGrey900)),
+          pw.SizedBox(height: 6),
+          pw.Text('Session: 2024 - 25',
+              style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold, color: PdfColors.blueGrey700)),
+          pw.SizedBox(height: 15),
+          pw.Divider(thickness: 2, color: PdfColors.blue900),
+          pw.SizedBox(height: 12),
+        ],
+      ),
+      footer: (ctx) => pw.Column(
+        children: [
+          pw.Divider(thickness: 0.5),
+          pw.Row(
+            mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+            children: [
+              pw.Text('This is a system-generated report',
+                  style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey)),
+              pw.Text('Page ${ctx.pageNumber} of ${ctx.pagesCount}',
+                  style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey)),
+            ],
+          ),
+        ],
+      ),
+      build: (ctx) => [
+        pw.Row(
+          mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+          children: [
+            pw.Column(
+              crossAxisAlignment: pw.CrossAxisAlignment.start,
+              children: [
+                pw.Text('Event: ${_selectedEventTitle ?? 'Event'}',
+                    style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold)),
+                pw.Text('Section: $_selectedSection | Year: $_selectedYear',
+                    style: const pw.TextStyle(fontSize: 10)),
+                pw.Text('Branch: $_selectedBranch',
+                    style: const pw.TextStyle(fontSize: 10)),
+              ],
+            ),
+            pw.Column(
+              crossAxisAlignment: pw.CrossAxisAlignment.end,
+              children: [
+                pw.Text('Date: ${fmt.format(DateTime.now())}',
+                    style: const pw.TextStyle(fontSize: 10)),
+                pw.Text('Total Participants: ${_entries.length}',
+                    style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold)),
+              ],
+            ),
+          ],
         ),
-        pw.SizedBox(height: 16),
-        pw.Table.fromTextArray(
+        pw.SizedBox(height: 20),
+        pw.TableHelper.fromTextArray(
           headers: ['#', 'Student Name', 'UID', 'Branch', 'Section', 'Year', 'Entry', 'Exit'],
-          headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 9),
-          headerDecoration: const pw.BoxDecoration(color: PdfColors.red100),
-          cellStyle: const pw.TextStyle(fontSize: 8),
+          headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10, color: PdfColors.white),
+          headerDecoration: const pw.BoxDecoration(color: PdfColors.blue800),
+          cellStyle: const pw.TextStyle(fontSize: 9),
+          cellAlignment: pw.Alignment.centerLeft,
+          headerAlignment: pw.Alignment.centerLeft,
+          border: pw.TableBorder.all(color: PdfColors.grey300, width: 0.5),
           data: _entries.asMap().entries.map((entry) {
             final i = entry.key + 1;
             final e = entry.value;
@@ -332,6 +546,26 @@ class _ReportScreenState extends State<ReportScreen>
               e.exitTime  != null ? DateFormat('HH:mm').format(e.exitTime!)  : '--:--',
             ];
           }).toList(),
+        ),
+        pw.SizedBox(height: 50),
+        pw.Row(
+          mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+          children: [
+            pw.Column(
+              children: [
+                pw.Container(width: 120, decoration: const pw.BoxDecoration(border: pw.Border(top: pw.BorderSide(width: 1)))),
+                pw.SizedBox(height: 5),
+                pw.Text('Faculty In-charge', style: const pw.TextStyle(fontSize: 10)),
+              ],
+            ),
+            pw.Column(
+              children: [
+                pw.Container(width: 120, decoration: const pw.BoxDecoration(border: pw.Border(top: pw.BorderSide(width: 1)))),
+                pw.SizedBox(height: 5),
+                pw.Text('HOD, CSE', style: const pw.TextStyle(fontSize: 10)),
+              ],
+            ),
+          ],
         ),
       ],
     ));
@@ -347,7 +581,7 @@ class _ReportScreenState extends State<ReportScreen>
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text(msg),
-      backgroundColor: const Color(0xFFC62828),
+      backgroundColor: const Color(0xFF0D47A1),
       behavior: SnackBarBehavior.floating,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
     ));
@@ -396,8 +630,8 @@ class _ReportScreenState extends State<ReportScreen>
       child: Row(children: [
         Container(
           padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(color: const Color(0xFFC62828).withOpacity(0.1), shape: BoxShape.circle),
-          child: const Icon(Icons.analytics_rounded, color: Color(0xFFC62828)),
+          decoration: BoxDecoration(color: const Color(0xFF0D47A1).withOpacity(0.1), shape: BoxShape.circle),
+          child: const Icon(Icons.analytics_rounded, color: Color(0xFF0D47A1)),
         ),
         const SizedBox(width: 16),
         const Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -415,7 +649,7 @@ class _ReportScreenState extends State<ReportScreen>
   Widget _buildDropdownFilters() {
     final border = OutlineInputBorder(
       borderRadius: BorderRadius.circular(12),
-      borderSide: const BorderSide(color: Color(0xFFC62828), width: 1.5),
+      borderSide: const BorderSide(color: Color(0xFF0D47A1), width: 1.5),
     );
     final inputDeco = InputDecoration(
       filled: true, fillColor: Colors.white,
@@ -429,13 +663,13 @@ class _ReportScreenState extends State<ReportScreen>
       _loadingEvents
           ? const Center(child: Padding(
               padding: EdgeInsets.symmetric(vertical: 8),
-              child: CircularProgressIndicator(color: Color(0xFFC62828)),
+              child: CircularProgressIndicator(color: Color(0xFF0D47A1)),
             ))
           : DropdownButtonFormField<String>(
               value: _selectedEventId,
               decoration: inputDeco.copyWith(
                 labelText: 'Select Event',
-                prefixIcon: const Icon(Icons.event_rounded, color: Color(0xFFC62828)),
+                prefixIcon: const Icon(Icons.event_rounded, color: Color(0xFF0D47A1)),
               ),
               hint: const Text('Choose an event...'),
               items: _events.map((e) => DropdownMenuItem(
@@ -459,7 +693,7 @@ class _ReportScreenState extends State<ReportScreen>
         value: _selectedSection,
         decoration: inputDeco.copyWith(
           labelText: 'Section',
-          prefixIcon: const Icon(Icons.class_outlined, color: Color(0xFFC62828)),
+          prefixIcon: const Icon(Icons.class_outlined, color: Color(0xFF0D47A1)),
         ),
         items: _sections.map((s) => DropdownMenuItem(
           value: s,
@@ -474,7 +708,7 @@ class _ReportScreenState extends State<ReportScreen>
         value: _selectedYear,
         decoration: inputDeco.copyWith(
           labelText: 'Year',
-          prefixIcon: const Icon(Icons.school_outlined, color: Color(0xFFC62828)),
+          prefixIcon: const Icon(Icons.school_outlined, color: Color(0xFF0D47A1)),
         ),
         items: _years.map((y) => DropdownMenuItem(value: y, child: Text(y))).toList(),
         onChanged: (v) => setState(() { _selectedYear = v; _generated = false; _entries = []; }),
@@ -486,15 +720,15 @@ class _ReportScreenState extends State<ReportScreen>
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
-        color: const Color(0xFFC62828).withOpacity(0.08),
+        color: const Color(0xFF0D47A1).withOpacity(0.08),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: const Color(0xFFC62828).withOpacity(0.25)),
+        border: Border.all(color: const Color(0xFF0D47A1).withOpacity(0.25)),
       ),
       child: Row(children: [
-        const Icon(Icons.auto_awesome, color: Color(0xFFC62828), size: 16),
+        const Icon(Icons.auto_awesome, color: Color(0xFF0D47A1), size: 16),
         const SizedBox(width: 8),
         Text('Auto-detected branch: ', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
-        Text(_selectedBranch ?? '', style: const TextStyle(color: Color(0xFFC62828), fontWeight: FontWeight.bold, fontSize: 13)),
+        Text(_selectedBranch ?? '', style: const TextStyle(color: Color(0xFF0D47A1), fontWeight: FontWeight.bold, fontSize: 13)),
       ]),
     );
   }
@@ -508,7 +742,7 @@ class _ReportScreenState extends State<ReportScreen>
         label: Text(_loading ? 'Generating…' : 'Generate Report',
             style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
         style: OutlinedButton.styleFrom(
-          backgroundColor: const Color(0xFFC62828),
+          backgroundColor: const Color(0xFF0D47A1),
           padding: const EdgeInsets.symmetric(vertical: 16),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
           side: BorderSide.none,
@@ -520,7 +754,7 @@ class _ReportScreenState extends State<ReportScreen>
   Widget _buildLoadingState() {
     return Center(child: Column(children: [
       const SizedBox(height: 16),
-      const CircularProgressIndicator(color: Color(0xFFC62828)),
+      const CircularProgressIndicator(color: Color(0xFF0D47A1)),
       const SizedBox(height: 20),
       const Text('Fetching attendance data…', style: TextStyle(color: Colors.grey, fontSize: 14, fontWeight: FontWeight.w500)),
       const SizedBox(height: 6),
@@ -536,7 +770,7 @@ class _ReportScreenState extends State<ReportScreen>
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         // Summary row
         Row(children: [
-          _buildSummaryCard('Students', '${_entries.length}', Icons.groups_rounded, const Color(0xFFC62828)),
+          _buildSummaryCard('Students', '${_entries.length}', Icons.groups_rounded, const Color(0xFF0D47A1)),
           const SizedBox(width: 12),
           _buildSummaryCard('Section', _selectedSection ?? '-', Icons.class_rounded, Colors.indigo),
         ]),
@@ -547,7 +781,7 @@ class _ReportScreenState extends State<ReportScreen>
           Expanded(child: _exportButton(
             icon: Icons.picture_as_pdf_rounded,
             label: 'Export PDF',
-            color: const Color(0xFFC62828),
+            color: const Color(0xFF0D47A1),
             onTap: _exportPdf,
           )),
           const SizedBox(width: 10),
@@ -717,7 +951,7 @@ class _ReportScreenState extends State<ReportScreen>
   }
 
   Color _nameColor(String name) {
-    final colors = [const Color(0xFFC62828), Colors.indigo, Colors.teal, Colors.orange, Colors.purple, const Color(0xFF0E1424)];
+    final colors = [const Color(0xFF0D47A1), Colors.indigo, Colors.teal, Colors.orange, Colors.purple, const Color(0xFF0E1424)];
     return colors[name.hashCode.abs() % colors.length];
   }
 }
